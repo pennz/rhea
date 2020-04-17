@@ -57,7 +57,9 @@ function get_default_connect_config() {
     var options = {};
     if (config.scheme === 'amqps') options.transport = 'tls';
     if (config.host) options.host = config.host;
-    if (config.port) options.port = config.port;
+    if(config.port === 'amqp') options.port = 5672;
+    else if(config.port === 'amqps') options.port = 5671;
+    else options.port = config.port;
     if (!(config.sasl && config.sasl.enabled === false)) {
         if (config.user) options.username = config.user;
         else options.username = 'anonymous';
@@ -68,7 +70,7 @@ function get_default_connect_config() {
         if (config.tls.key) options.key = fs.readFileSync(config.tls.key);
         if (config.tls.cert) options.cert = fs.readFileSync(config.tls.cert);
         if (config.tls.ca) options.ca = [ fs.readFileSync(config.tls.ca) ];
-        if (config.verify === false) options.rejectUnauthorized = false;
+        if (config.verify === false || config.tls.verify === false) options.rejectUnauthorized = false;
     }
     if (options.transport === 'tls') {
         options.servername = options.host;
@@ -173,6 +175,29 @@ function connection_fields(fields) {
     return o;
 }
 
+function set_reconnect(reconnect, connection) {
+    if (typeof reconnect === 'boolean') {
+        if (reconnect) {
+            var initial = connection.get_option('initial_reconnect_delay', 100);
+            var max = connection.get_option('max_reconnect_delay', 60000);
+            connection.options.reconnect = restrict(
+                connection.get_option('reconnect_limit'),
+                backoff(initial, max)
+            );
+        } else {
+            connection.options.reconnect = false;
+        }
+    } else if (typeof reconnect === 'number') {
+        var fixed = connection.options.reconnect;
+        connection.options.reconnect = restrict(
+            connection.get_option('reconnect_limit'),
+            function() {
+                return fixed;
+            }
+        );
+    }
+}
+
 var conn_counter = 1;
 
 var Connection = function (options, container) {
@@ -200,14 +225,7 @@ var Connection = function (options, container) {
         this.options.connection_details = function() { return connection_details(self.options); };
     }
     var reconnect = this.get_option('reconnect', true);
-    if (typeof reconnect === 'boolean' && reconnect) {
-        var initial = this.get_option('initial_reconnect_delay', 100);
-        var max = this.get_option('max_reconnect_delay', 60000);
-        this.options.reconnect = restrict(this.get_option('reconnect_limit'), backoff(initial, max));
-    } else if (typeof reconnect === 'number') {
-        var fixed = this.options.reconnect;
-        this.options.reconnect = restrict(this.get_option('reconnect_limit'), function () { return fixed; });
-    }
+    set_reconnect(reconnect, this);
     this.registered = false;
     this.state = new EndpointState();
     this.local_channel_map = {};
@@ -229,10 +247,8 @@ var Connection = function (options, container) {
     this.default_sender = undefined;
     this.closed_with_non_fatal_error = false;
 
-    for (var i in aliases) {
-        var f = aliases[i];
-        Object.defineProperty(this, f, { get: remote_property_shortcut(f) });
-    }
+    var self = this;
+    aliases.forEach(function (alias) { Object.defineProperty(self, alias, { get: remote_property_shortcut(alias) }); });
     Object.defineProperty(this, 'error', { get:  function() { return this.remote.close ? this.remote.close.error : undefined; }});
 };
 
@@ -287,6 +303,7 @@ Connection.prototype._reset_remote_state = function() {
 
 Connection.prototype.connect = function () {
     this.is_server = false;
+    this.abort_idle = false;
     this._reset_remote_state();
     this._connect(this.options.connection_details(this.conn_established_counter));
     this.open();
@@ -300,6 +317,10 @@ Connection.prototype.reconnect = function () {
     this._connect(this.options.connection_details(this.conn_established_counter));
     process.nextTick(this._process.bind(this));
     return this;
+};
+
+Connection.prototype.set_reconnect = function (reconnect) {
+    set_reconnect(reconnect, this);
 };
 
 Connection.prototype._connect = function (details) {
@@ -316,6 +337,18 @@ Connection.prototype.accept = function (socket) {
     log.io('[%s] client accepted: %s', this.id, get_socket_id(socket));
     this.socket_ready = true;
     return this.init(socket);
+};
+
+
+Connection.prototype.abort_socket = function (socket) {
+    if (socket === this.socket) {
+        log.io('[%s] aborting socket', this.options.id);
+        this.socket.end();
+        this.socket.removeAllListeners('data');
+        this.socket.removeAllListeners('error');
+        this.socket.removeAllListeners('end');
+        this._disconnected();
+    }
 };
 
 Connection.prototype.init = function (socket) {
@@ -407,8 +440,8 @@ Connection.prototype.connected = function () {
     this.output();
 };
 
-Connection.prototype.sasl_failed = function (text) {
-    this.transport_error = new errors.ConnectionError(text, 'amqp:unauthorized-access', this);
+Connection.prototype.sasl_failed = function (text, condition) {
+    this.transport_error = new errors.ConnectionError(text, condition ? condition : 'amqp:unauthorized-access', this);
     this._handle_error();
     this.socket.end();
 };
@@ -464,8 +497,12 @@ Connection.prototype.output = function () {
             } else if (this.is_open() && this.remote.open.idle_time_out) {
                 this.heartbeat_out = setTimeout(this._write_frame.bind(this), this.remote.open.idle_time_out / 2);
             }
+            if (this.local.open.idle_time_out && this.heartbeat_in === undefined) {
+                this.heartbeat_in = setTimeout(this.idle.bind(this), this.local.open.idle_time_out);
+            }
         }
     } catch (e) {
+        this.saved_error = e;
         if (e.name === 'ProtocolError') {
             console.error('[' + this.options.id + '] error on write: ' + e + ' ' + this._get_peer_details() + ' ' + e.name);
             this.dispatch('protocol_error', e) || console.error('[' + this.options.id + '] error on write: ' + e + ' ' + this._get_peer_details());
@@ -513,6 +550,7 @@ Connection.prototype.input = function (buff) {
             this.heartbeat_out = setTimeout(this._write_frame.bind(this), this.remote.open.idle_time_out / 2);
         }
     } catch (e) {
+        this.saved_error = e;
         if (e.name === 'ProtocolError') {
             this.dispatch('protocol_error', e) ||
                 console.error('[' + this.options.id + '] error on read: ' + e + ' ' + this._get_peer_details() + ' (buffer:' + buffer_to_hex(buffer) + ')');
@@ -525,10 +563,12 @@ Connection.prototype.input = function (buff) {
 };
 
 Connection.prototype.idle = function () {
-    if (this.is_open()) {
+    if (!this.is_closed()) {
         this.abort_idle = true;
+        this.closed_with_non_fatal_error = true;
         this.local.close.error = {condition:'amqp:resource-limit-exceeded', description:'max idle time exceeded'};
         this.close();
+        setTimeout(this.abort_socket.bind(this, this.socket), 1000);
     }
 };
 
@@ -537,12 +577,20 @@ Connection.prototype.on_error = function (e) {
 };
 
 Connection.prototype.eof = function (e) {
-    this._disconnected(e);
+    var error = e || this.saved_error;
+    this.saved_error = undefined;
+    this._disconnected(error);
 };
 
 Connection.prototype._disconnected = function (error) {
-    if (this.heartbeat_out) clearTimeout(this.heartbeat_out);
-    if (this.heartbeat_in) clearTimeout(this.heartbeat_in);
+    if (this.heartbeat_out) {
+        clearTimeout(this.heartbeat_out);
+        this.heartbeat_out = undefined;
+    }
+    if (this.heartbeat_in) {
+        clearTimeout(this.heartbeat_in);
+        this.heartbeat_in = undefined;
+    }
     var was_closed_with_non_fatal_error = this.closed_with_non_fatal_error;
     if (this.closed_with_non_fatal_error) {
         this.closed_with_non_fatal_error = false;
@@ -736,8 +784,12 @@ Connection.prototype._context = function (c) {
 };
 
 Connection.prototype.remove_session = function (session) {
-    delete this.remote_channel_map[session.remote.channel];
-    delete this.local_channel_map[session.local.channel];
+    if (this.remote_channel_map[session.remote.channel] === session) {
+        delete this.remote_channel_map[session.remote.channel];
+    }
+    if (this.local_channel_map[session.local.channel] === session) {
+        delete this.local_channel_map[session.local.channel];
+    }
 };
 
 Connection.prototype.remove_all_sessions = function () {
@@ -765,7 +817,7 @@ delegate_to_session('flow');
 module.exports = Connection;
 
 }).call(this,require('_process'),require("buffer").Buffer)
-},{"./endpoint.js":2,"./errors.js":3,"./frames.js":6,"./log.js":8,"./sasl.js":10,"./session.js":11,"./transport.js":13,"./util.js":15,"_process":28,"buffer":19,"events":22,"fs":18,"net":18,"os":26,"path":27,"tls":18}],2:[function(require,module,exports){
+},{"./endpoint.js":2,"./errors.js":3,"./frames.js":6,"./log.js":8,"./sasl.js":10,"./session.js":11,"./transport.js":13,"./util.js":15,"_process":27,"buffer":19,"events":22,"fs":18,"net":18,"os":25,"path":26,"tls":18}],2:[function(require,module,exports){
 /*
  * Copyright 2015 Red Hat Inc.
  *
@@ -1635,6 +1687,9 @@ link.prefix_event = function (event) {
 
 link.on_detach = function (frame) {
     if (this.state.remote_closed()) {
+        if (this._incomplete) {
+            this._incomplete.settled = true;
+        }
         this.remote.detach = frame.performative;
         var error = this.remote.detach.error;
         if (error) {
@@ -1706,10 +1761,8 @@ link.init = function (session, name, local_handle, opts, is_receiver) {
     this.delivery_count = 0;
     this.credit = 0;
     this.observers = new EventEmitter();
-    for (var i in aliases) {
-        var alias = aliases[i];
-        Object.defineProperty(this, alias, { get: remote_property_shortcut(alias) });
-    }
+    var self = this;
+    aliases.forEach(function (alias) { Object.defineProperty(self, alias, { get: remote_property_shortcut(alias) }); });
     Object.defineProperty(this, 'error', { get:  function() { return this.remote.detach ? this.remote.detach.error : undefined; }});
 };
 
@@ -1865,7 +1918,7 @@ Receiver.prototype.set_credit_window = function(credit_window) {
 module.exports = {'Sender': Sender, 'Receiver':Receiver};
 
 }).call(this,require('_process'),require("buffer").Buffer)
-},{"./endpoint.js":2,"./frames.js":6,"./log.js":8,"./message.js":9,"./terminus.js":12,"_process":28,"buffer":19,"events":22,"util":30}],8:[function(require,module,exports){
+},{"./endpoint.js":2,"./frames.js":6,"./log.js":8,"./message.js":9,"./terminus.js":12,"_process":27,"buffer":19,"events":22,"util":30}],8:[function(require,module,exports){
 /*
  * Copyright 2015 Red Hat Inc.
  *
@@ -2198,7 +2251,6 @@ define_outcome({
 module.exports = message;
 
 },{"./log.js":8,"./types.js":14}],10:[function(require,module,exports){
-(function (Buffer){
 /*
  * Copyright 2015 Red Hat Inc.
  *
@@ -2219,6 +2271,7 @@ module.exports = message;
 var errors = require('./errors.js');
 var frames = require('./frames.js');
 var Transport = require('./transport.js');
+var util = require('./util.js');
 
 var sasl_codes = {
     'OK':0,
@@ -2257,14 +2310,18 @@ var PlainServer = function(callback) {
 PlainServer.prototype.start = function(response, hostname) {
     var fields = extract(response);
     if (fields.length !== 3) {
-        this.connection.sasl_failed('Unexpected response in PLAIN, got ' + fields.length + ' fields, expected 3');
+        return Promise.reject('Unexpected response in PLAIN, got ' + fields.length + ' fields, expected 3');
     }
-    if (this.callback(fields[1], fields[2], hostname)) {
-        this.outcome = true;
-        this.username = fields[1];
-    } else {
-        this.outcome = false;
-    }
+    var self = this;
+    return Promise.resolve(this.callback(fields[1], fields[2], hostname))
+        .then(function (result) {
+            if (result) {
+                self.outcome = true;
+                self.username = fields[1];
+            } else {
+                self.outcome = false;
+            }
+        });
 };
 
 var PlainClient = function(username, password) {
@@ -2273,7 +2330,7 @@ var PlainClient = function(username, password) {
 };
 
 PlainClient.prototype.start = function(callback) {
-    var response = Buffer.alloc(1 + this.username.length + 1 + this.password.length);
+    var response = util.allocate_buffer(1 + this.username.length + 1 + this.password.length);
     response.writeUInt8(0, 0);
     response.write(this.username, 1);
     response.writeUInt8(0, 1 + this.username.length);
@@ -2296,7 +2353,7 @@ var AnonymousClient = function(name) {
 };
 
 AnonymousClient.prototype.start = function(callback) {
-    var response = Buffer.alloc(1 + this.username.length);
+    var response = util.allocate_buffer(1 + this.username.length);
     response.writeUInt8(0, 0);
     response.write(this.username, 1);
     callback(undefined, response);
@@ -2329,7 +2386,7 @@ var XOAuth2Client = function(username, token) {
 };
 
 XOAuth2Client.prototype.start = function(callback) {
-    var response = Buffer.alloc(this.username.length + this.token.length + 5 + 12 + 3);
+    var response = util.allocate_buffer(this.username.length + this.token.length + 5 + 12 + 3);
     var count = 0;
     response.write('user=', count);
     count += 5;
@@ -2367,9 +2424,12 @@ var SaslServer = function (connection, mechanisms) {
 SaslServer.prototype.do_step = function (challenge) {
     if (this.mechanism.outcome === undefined) {
         this.transport.encode(frames.sasl_frame(frames.sasl_challenge({'challenge':challenge})));
+        this.connection.output();
     } else {
         this.outcome = this.mechanism.outcome ? sasl_codes.OK : sasl_codes.AUTH;
-        this.transport.encode(frames.sasl_frame(frames.sasl_outcome({code: this.outcome})));
+        var frame = frames.sasl_frame(frames.sasl_outcome({code: this.outcome}));
+        this.transport.encode(frame);
+        this.connection.output();
         if (this.outcome === sasl_codes.OK) {
             this.username = this.mechanism.username;
             this.transport.write_complete = true;
@@ -2379,18 +2439,33 @@ SaslServer.prototype.do_step = function (challenge) {
 };
 
 SaslServer.prototype.on_sasl_init = function (frame) {
-    var f = this.mechanisms[frame.performative.mechanism];
-    if (f) {
-        this.mechanism = f();
-        var challenge = this.mechanism.start(frame.performative.initial_response, frame.performative.hostname);
-        this.do_step(challenge);
+    var saslctor = this.mechanisms[frame.performative.mechanism];
+    if (saslctor) {
+        this.mechanism = saslctor();
+        Promise.resolve(this.mechanism.start(frame.performative.initial_response, frame.performative.hostname))
+            .then(this.do_step.bind(this))
+            .catch(this.do_fail.bind(this));
     } else {
         this.outcome = sasl_codes.AUTH;
         this.transport.encode(frames.sasl_frame(frames.sasl_outcome({code: this.outcome})));
     }
 };
+
 SaslServer.prototype.on_sasl_response = function (frame) {
-    this.do_step(this.mechanism.step(frame.performative.response));
+    Promise.resolve(this.mechanism.step(frame.performative.response))
+        .then(this.do_step.bind(this))
+        .catch(this.do_fail.bind(this));
+};
+
+SaslServer.prototype.do_fail = function (e) {
+    var frame = frames.sasl_frame(frames.sasl_outcome({code: sasl_codes.SYS}));
+    this.transport.encode(frame);
+    this.connection.output();
+    try {
+        this.connection.sasl_failed('Sasl callback promise failed with ' + e, 'amqp:internal-error');
+    } catch (e) {
+        console.error('Uncaught error: ', e.message);
+    }
 };
 
 SaslServer.prototype.has_writes_pending = function () {
@@ -2476,6 +2551,12 @@ SaslClient.prototype.on_sasl_outcome = function (frame) {
     case sasl_codes.OK:
         this.transport.read_complete = true;
         this.transport.write_complete = true;
+        break;
+    case sasl_codes.SYS:
+    case sasl_codes.SYS_PERM:
+    case sasl_codes.SYS_TEMP:
+        this.transport.write_complete = true;
+        this.connection.sasl_failed('Failed to authenticate: ' + frame.performative.code, 'amqp:internal-error');
         break;
     default:
         this.transport.write_complete = true;
@@ -2585,8 +2666,7 @@ module.exports = {
     }
 };
 
-}).call(this,require("buffer").Buffer)
-},{"./errors.js":3,"./frames.js":6,"./transport.js":13,"buffer":19}],11:[function(require,module,exports){
+},{"./errors.js":3,"./frames.js":6,"./transport.js":13,"./util.js":15}],11:[function(require,module,exports){
 (function (process,Buffer){
 /*
  * Copyright 2015 Red Hat Inc.
@@ -2897,13 +2977,11 @@ Incoming.prototype.on_transfer = function(frame, receiver) {
         }
         var current;
         var data;
-        var last = this.deliveries.get_tail();
-        if (last && last.incomplete) {
-            if (util.is_defined(frame.performative.delivery_id) && this.next_delivery_id !== frame.performative.delivery_id) {
-                //TODO: better error handling
-                throw Error('frame sequence error: delivery ' + this.next_delivery_id + ' not complete, got ' + frame.performative.delivery_id);
+        if (receiver._incomplete) {
+            current = receiver._incomplete;
+            if (util.is_defined(frame.performative.delivery_id) && current.id !== frame.performative.delivery_id) {
+                throw Error('frame sequence error: delivery ' + current.id + ' not complete, got ' + frame.performative.delivery_id);
             }
-            current = last;
             data = Buffer.concat([current.data, frame.payload], current.data.length + frame.payload.length);
         } else if (this.next_delivery_id === frame.performative.delivery_id) {
             current = {'id':frame.performative.delivery_id,
@@ -2934,6 +3012,7 @@ Incoming.prototype.on_transfer = function(frame, receiver) {
             current.modified = function (params) { this.update(undefined, message.modified(params).described()); };
 
             this.deliveries.push(current);
+            this.next_delivery_id++;
             data = frame.payload;
         } else {
             //TODO: better error handling
@@ -2941,12 +3020,13 @@ Incoming.prototype.on_transfer = function(frame, receiver) {
         }
         current.incomplete = frame.performative.more;
         if (current.incomplete) {
+            receiver._incomplete = current;
             current.data = data;
         } else {
+            receiver._incomplete = undefined;
             if (receiver.credit > 0) receiver.credit--;
             else console.error('Received transfer when credit was %d', receiver.credit);
             receiver.delivery_count++;
-            this.next_delivery_id++;
             var msgctxt = current.format === 0 ? {'message':message.decode(data), 'delivery':current} : {'message':data, 'delivery':current, 'format':current.format};
             receiver.dispatch('message', receiver._context(msgctxt));
         }
@@ -3342,7 +3422,7 @@ Session.prototype.on_transfer = function (frame) {
 module.exports = Session;
 
 }).call(this,require('_process'),require("buffer").Buffer)
-},{"./endpoint.js":2,"./frames.js":6,"./link.js":7,"./log.js":8,"./message.js":9,"./types.js":14,"./util.js":15,"_process":28,"buffer":19,"events":22,"util":30}],12:[function(require,module,exports){
+},{"./endpoint.js":2,"./frames.js":6,"./link.js":7,"./log.js":8,"./message.js":9,"./types.js":14,"./util.js":15,"_process":27,"buffer":19,"events":22,"util":30}],12:[function(require,module,exports){
 /*
  * Copyright 2015 Red Hat Inc.
  *
@@ -3419,7 +3499,6 @@ define_terminus({
 module.exports = terminus;
 
 },{"./types.js":14}],13:[function(require,module,exports){
-(function (Buffer){
 /*
  * Copyright 2015 Red Hat Inc.
  *
@@ -3440,6 +3519,7 @@ module.exports = terminus;
 var errors = require('./errors.js');
 var frames = require('./frames.js');
 var log = require('./log.js');
+var util = require('./util.js');
 
 
 var Transport = function (identifier, protocol_id, frame_type, handler) {
@@ -3464,7 +3544,7 @@ Transport.prototype.encode = function (frame) {
 
 Transport.prototype.write = function (socket) {
     if (!this.header_sent) {
-        var buffer = Buffer.alloc(8);
+        var buffer = util.allocate_buffer(8);
         var header = {protocol_id:this.protocol_id, major:1, minor:0, revision:0};
         log.frames('[%s] -> %o', this.identifier, header);
         frames.write_header(buffer, header);
@@ -3536,8 +3616,7 @@ Transport.prototype.read = function (buffer) {
 
 module.exports = Transport;
 
-}).call(this,require("buffer").Buffer)
-},{"./errors.js":3,"./frames.js":6,"./log.js":8,"buffer":19}],14:[function(require,module,exports){
+},{"./errors.js":3,"./frames.js":6,"./log.js":8,"./util.js":15}],14:[function(require,module,exports){
 (function (Buffer){
 /*
  * Copyright 2015 Red Hat Inc.
@@ -3557,6 +3636,7 @@ module.exports = Transport;
 'use strict';
 
 var errors = require('./errors.js');
+var util = require('./util.js');
 
 var CAT_FIXED = 1;
 var CAT_VARIABLE = 2;
@@ -3935,10 +4015,10 @@ types.wrap_binary = function (s) {
     return s.length > 255 ? types.Vbin32(s) : types.Vbin8(s);
 };
 types.wrap_string = function (s) {
-    return s.length > 255 ? types.Str32(s) : types.Str8(s);
+    return Buffer.byteLength(s) > 255 ? types.Str32(s) : types.Str8(s);
 };
 types.wrap_symbol = function (s) {
-    return s.length > 255 ? types.Sym32(s) : types.Sym8(s);
+    return Buffer.byteLength(s) > 255 ? types.Sym32(s) : types.Sym8(s);
 };
 types.wrap_list = function(l) {
     if (l.length === 0) return types.List0();
@@ -3992,7 +4072,7 @@ types.wrap = function(o) {
         return types.wrap_timestamp(o.getTime());
     } else if (o instanceof Typed) {
         return o;
-    } else if (o instanceof Buffer) {
+    } else if (o instanceof Buffer || o instanceof ArrayBuffer) {
         return types.wrap_binary(o);
     } else if (t === 'undefined' || o === null) {
         return types.Null();
@@ -4234,7 +4314,7 @@ types.Reader.prototype.remaining = function () {
 };
 
 types.Writer = function (buffer) {
-    this.buffer = buffer ? buffer : Buffer.alloc(1024);
+    this.buffer = buffer ? buffer : util.allocate_buffer(1024);
     this.position = 0;
 };
 
@@ -4248,7 +4328,7 @@ function max(a, b) {
 
 types.Writer.prototype.ensure = function (length) {
     if (this.buffer.length < length) {
-        var bigger = Buffer.alloc(max(this.buffer.length*2, length));
+        var bigger = util.allocate_buffer(max(this.buffer.length*2, length));
         this.buffer.copy(bigger);
         this.buffer = bigger;
     }
@@ -4502,7 +4582,7 @@ add_type({
 module.exports = types;
 
 }).call(this,require("buffer").Buffer)
-},{"./errors.js":3,"buffer":19}],15:[function(require,module,exports){
+},{"./errors.js":3,"./util.js":15,"buffer":19}],15:[function(require,module,exports){
 (function (Buffer){
 /*
  * Copyright 2015 Red Hat Inc.
@@ -4525,12 +4605,16 @@ var errors = require('./errors.js');
 
 var util = {};
 
+util.allocate_buffer = function (size) {
+    return Buffer.alloc ? Buffer.alloc(size) : new Buffer(size);
+};
+
 util.generate_uuid = function () {
     return util.uuid_to_string(util.uuid4());
 };
 
 util.uuid4 = function () {
-    var bytes = Buffer.alloc(16);
+    var bytes = util.allocate_buffer(16);
     for (var i = 0; i < bytes.length; i++) {
         bytes[i] = Math.random()*255|0;
     }
@@ -4751,7 +4835,8 @@ function toByteArray (b64) {
     ? validLen - 4
     : validLen
 
-  for (var i = 0; i < len; i += 4) {
+  var i
+  for (i = 0; i < len; i += 4) {
     tmp =
       (revLookup[b64.charCodeAt(i)] << 18) |
       (revLookup[b64.charCodeAt(i + 1)] << 12) |
@@ -4839,6 +4924,7 @@ function fromByteArray (uint8) {
 },{}],18:[function(require,module,exports){
 
 },{}],19:[function(require,module,exports){
+(function (Buffer){
 /*!
  * The buffer module from node.js, for the browser.
  *
@@ -6617,7 +6703,8 @@ function numberIsNaN (obj) {
   return obj !== obj // eslint-disable-line no-self-compare
 }
 
-},{"base64-js":17,"ieee754":23}],20:[function(require,module,exports){
+}).call(this,require("buffer").Buffer)
+},{"base64-js":17,"buffer":19,"ieee754":23}],20:[function(require,module,exports){
 (function (process){
 "use strict";
 
@@ -6801,7 +6888,7 @@ formatters.j = function (v) {
 
 
 }).call(this,require('_process'))
-},{"./common":21,"_process":28}],21:[function(require,module,exports){
+},{"./common":21,"_process":27}],21:[function(require,module,exports){
 "use strict";
 
 /**
@@ -7052,7 +7139,7 @@ function setup(env) {
 module.exports = setup;
 
 
-},{"ms":25}],22:[function(require,module,exports){
+},{"ms":24}],22:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -7664,31 +7751,6 @@ exports.write = function (buffer, value, offset, isLE, mLen, nBytes) {
 }
 
 },{}],24:[function(require,module,exports){
-if (typeof Object.create === 'function') {
-  // implementation from standard node.js 'util' module
-  module.exports = function inherits(ctor, superCtor) {
-    ctor.super_ = superCtor
-    ctor.prototype = Object.create(superCtor.prototype, {
-      constructor: {
-        value: ctor,
-        enumerable: false,
-        writable: true,
-        configurable: true
-      }
-    });
-  };
-} else {
-  // old school shim for old browsers
-  module.exports = function inherits(ctor, superCtor) {
-    ctor.super_ = superCtor
-    var TempCtor = function () {}
-    TempCtor.prototype = superCtor.prototype
-    ctor.prototype = new TempCtor()
-    ctor.prototype.constructor = ctor
-  }
-}
-
-},{}],25:[function(require,module,exports){
 /**
  * Helpers.
  */
@@ -7719,7 +7781,7 @@ module.exports = function(val, options) {
   var type = typeof val;
   if (type === 'string' && val.length > 0) {
     return parse(val);
-  } else if (type === 'number' && isNaN(val) === false) {
+  } else if (type === 'number' && isFinite(val)) {
     return options.long ? fmtLong(val) : fmtShort(val);
   }
   throw new Error(
@@ -7741,7 +7803,7 @@ function parse(str) {
   if (str.length > 100) {
     return;
   }
-  var match = /^((?:\d+)?\-?\d?\.?\d+) *(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|years?|yrs?|y)?$/i.exec(
+  var match = /^(-?(?:\d+)?\.?\d+) *(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|years?|yrs?|y)?$/i.exec(
     str
   );
   if (!match) {
@@ -7852,7 +7914,7 @@ function plural(ms, msAbs, n, name) {
   return Math.round(ms / n) + ' ' + name + (isPlural ? 's' : '');
 }
 
-},{}],26:[function(require,module,exports){
+},{}],25:[function(require,module,exports){
 exports.endianness = function () { return 'LE' };
 
 exports.hostname = function () {
@@ -7903,7 +7965,7 @@ exports.homedir = function () {
 	return '/'
 };
 
-},{}],27:[function(require,module,exports){
+},{}],26:[function(require,module,exports){
 (function (process){
 // .dirname, .basename, and .extname methods are extracted from Node.js v8.11.1,
 // backported and transplited with Babel, with backwards-compat fixes
@@ -8209,7 +8271,7 @@ var substr = 'ab'.substr(-1) === 'b'
 ;
 
 }).call(this,require('_process'))
-},{"_process":28}],28:[function(require,module,exports){
+},{"_process":27}],27:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
 
@@ -8394,6 +8456,31 @@ process.chdir = function (dir) {
     throw new Error('process.chdir is not supported');
 };
 process.umask = function() { return 0; };
+
+},{}],28:[function(require,module,exports){
+if (typeof Object.create === 'function') {
+  // implementation from standard node.js 'util' module
+  module.exports = function inherits(ctor, superCtor) {
+    ctor.super_ = superCtor
+    ctor.prototype = Object.create(superCtor.prototype, {
+      constructor: {
+        value: ctor,
+        enumerable: false,
+        writable: true,
+        configurable: true
+      }
+    });
+  };
+} else {
+  // old school shim for old browsers
+  module.exports = function inherits(ctor, superCtor) {
+    ctor.super_ = superCtor
+    var TempCtor = function () {}
+    TempCtor.prototype = superCtor.prototype
+    ctor.prototype = new TempCtor()
+    ctor.prototype.constructor = ctor
+  }
+}
 
 },{}],29:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
@@ -8992,7 +9079,7 @@ function hasOwnProperty(obj, prop) {
 }
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":29,"_process":28,"inherits":24}],"rhea":[function(require,module,exports){
+},{"./support/isBuffer":29,"_process":27,"inherits":28}],"rhea":[function(require,module,exports){
 (function (process){
 /*
  * Copyright 2015 Red Hat Inc.
@@ -9043,8 +9130,10 @@ Container.prototype.dispatch = function(name) {
 };
 
 Container.prototype.connect = function (options) {
-    return new Connection(options, this).connect();
+    this.connection = new Connection(options, this);
+    return this.connection.connect();
 };
+Container.prototype.disconnect = function () { this.connection.close(); };
 
 Container.prototype.create_connection = function (options) {
     return new Connection(options, this);
@@ -9103,4 +9192,4 @@ Container.prototype.ConnectionEvents = eventTypes.ConnectionEvents;
 module.exports = new Container();
 
 }).call(this,require('_process'))
-},{"./connection.js":1,"./eventTypes.js":4,"./filter.js":5,"./log.js":8,"./message.js":9,"./sasl.js":10,"./types.js":14,"./util.js":15,"./ws.js":16,"_process":28,"events":22,"net":18,"tls":18}]},{},[]);
+},{"./connection.js":1,"./eventTypes.js":4,"./filter.js":5,"./log.js":8,"./message.js":9,"./sasl.js":10,"./types.js":14,"./util.js":15,"./ws.js":16,"_process":27,"events":22,"net":18,"tls":18}]},{},[]);
