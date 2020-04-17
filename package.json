@@ -8,11 +8,7 @@
     "type": "git",
     "url": "git+ssh://git@github.com/amqp/rhea.git"
   },
-  "browser": {
-    "fs": false,
-    "net": false,
-    "tls": false
-  },
+  "browser": {},
   "dependencies": {
     "debug": "0.8.0 - 3.5.0"
   },
@@ -38,6 +34,7 @@
     "test": "npm run lint && npm run tsc && mocha -r ts-node/register ./test/*.ts",
     "coverage": "istanbul cover _mocha -- test/*.ts --compilers ts-node/register",
     "browserify": "browserify -r .:rhea -o dist/rhea.js",
+    "build": "webpack",
     "run-examples": "require-self && mocha examples/test_examples.js",
     "uglify": "uglifyjs --source-map --output dist/rhea.min.js dist/rhea.js",
     "prepare": "npm run lint && npm run tsc",
